@@ -1,0 +1,392 @@
+---
+title: "NBA MVP predictive model"
+author: "Andrew Rasmussen"
+date: "2024-08-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+mvp_data <- read.csv("NBA_dataset.csv")
+```
+
+```{r}
+# Load necessary libraries
+library(tidyverse)
+library(caret)
+library(lubridate)
+library(zoo)
+library(ggplot2)
+library(plotly)
+
+# Let's assume the data is loaded in a dataframe called 'mvp_data'
+# Here's what we need to do for preparation:
+
+# 1. Convert season to numeric or factor as appropriate
+
+# 2. Handle missing values
+mvp_data <- mvp_data %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+# 3. Create an MVP winner indicator
+# Typically, the player with the highest award_share wins MVP
+mvp_data <- mvp_data %>%
+  group_by(season) %>%
+  mutate(is_mvp = award_share == max(award_share)) %>%
+  ungroup()
+
+# 4. Feature engineering
+mvp_data <- mvp_data %>%
+  mutate(
+    # Points-rebounds-assists composite
+    pra = pts_per_g + trb_per_g + ast_per_g,
+    
+    # Efficiency metrics combination
+    efficiency = (ts_pct * 100) + efg_pct * 100,
+    
+    # Two-way player indicator
+    two_way_score = obpm + dbpm,
+    
+    # Value metrics
+    value_composite = (vorp * 5) + ws,
+    
+    # Team success weight
+    team_success = win_loss_pct * 100,
+    
+    # Games played percentage (approximating)
+    games_played_pct = g / 82,
+    
+    # Position indicators
+    is_guard = ifelse(pos %in% c("PG", "SG", "G"), 1, 0),
+    is_forward = ifelse(pos %in% c("SF", "PF", "F"), 1, 0),
+    is_center = ifelse(pos %in% c("C"), 1, 0)
+  )
+
+# 5. Normalize features to avoid scale issues
+preproc_params <- preProcess(mvp_data %>% select(where(is.numeric)), method = c("center", "scale"))
+mvp_data_scaled <- predict(preproc_params, mvp_data)
+
+# 6. Create time-based features to capture trends
+mvp_data_scaled <- mvp_data_scaled %>%
+  group_by(player) %>%
+  mutate(
+    pts_trend = pts_per_g - lag(pts_per_g, default = first(pts_per_g)),
+    ws_trend = ws - lag(ws, default = first(ws))
+  ) %>%
+  ungroup()
+
+# 7. Split into training and testing datasets
+# Let's use data up to 2018 for training and 2019-2022 for testing
+train_data <- mvp_data_scaled %>% filter(season <= 1.22)
+test_data <- mvp_data_scaled %>% filter(season > 1.22)
+```
+
+```{r}
+# Load necessary libraries
+library(tidyverse)
+library(caret)
+library(glmnet)      # For LASSO and Ridge regression
+library(xgboost)     # For XGBoost
+library(e1071)       # For Support Vector Machines
+library(keras)       # For neural networks
+library(rpart)       # For decision trees
+library(kernlab)     # For Gaussian Process
+
+# Build the model using these key components:
+# 1. Feature selection to identify important predictors
+# 2. Training multiple alternative models
+
+# Since we're not using Random Forest for feature importance anymore,
+# let's use a more general correlation approach
+correlation_matrix <- cor(
+  train_data %>% 
+    select(award_share, pts_per_g, trb_per_g, ast_per_g, stl_per_g, blk_per_g,
+           ts_pct, ws, vorp, bpm, win_loss_pct, pra, efficiency,
+           two_way_score, value_composite, team_success, games_played_pct)
+)
+
+# Find correlations with award_share
+award_share_correlations <- correlation_matrix[1, -1]
+correlation_df <- data.frame(
+  Variable = names(award_share_correlations),
+  Correlation = abs(award_share_correlations)
+)
+correlation_df <- correlation_df[order(correlation_df$Correlation, decreasing = TRUE), ]
+
+# Select top features based on correlation
+top_features <- correlation_df$Variable[1:10]
+
+# Create formula with top features
+formula_str <- paste("award_share ~", paste(top_features, collapse = " + "))
+formula_obj <- as.formula(formula_str)
+
+# Define common training control
+train_control <- trainControl(
+  method = "cv",  # Cross-validation
+  number = 5,     # 5-fold
+  verboseIter = FALSE
+)
+
+# Create a matrix version of the data for models that require it
+x_train <- model.matrix(formula_obj, train_data)[,-1]  # Remove intercept
+y_train <- train_data$award_share
+
+x_test <- model.matrix(formula_obj, test_data)[,-1]  # Remove intercept
+y_test <- test_data$award_share
+
+# 1. Linear Regression (baseline)
+lm_model <- train(
+  formula_obj,
+  data = train_data,
+  method = "lm",
+  trControl = train_control
+)
+
+# 2. LASSO Regression (L1 regularization)
+lasso_model <- train(
+  x = x_train,
+  y = y_train,
+  method = "glmnet",
+  trControl = train_control,
+  tuneGrid = expand.grid(
+    alpha = 1,  # LASSO
+    lambda = seq(0.001, 0.1, by = 0.001)
+  )
+)
+
+# 3. Ridge Regression (L2 regularization)
+ridge_model <- train(
+  x = x_train,
+  y = y_train,
+  method = "glmnet",
+  trControl = train_control,
+  tuneGrid = expand.grid(
+    alpha = 0,  # Ridge
+    lambda = seq(0.001, 0.1, by = 0.001)
+  )
+)
+
+# 4. Elastic Net (combination of L1 and L2)
+elastic_net_model <- train(
+  x = x_train,
+  y = y_train,
+  method = "glmnet",
+  trControl = train_control,
+  tuneGrid = expand.grid(
+    alpha = seq(0, 1, by = 0.2),  # Mix of LASSO and Ridge
+    lambda = seq(0.001, 0.1, by = 0.005)
+  )
+)
+
+# 5. Gradient Boosting Machine (still keeping this one)
+gbm_model <- train(
+  formula_obj,
+  data = train_data,
+  method = "gbm",
+  trControl = train_control,
+  verbose = FALSE
+)
+
+# 6. Support Vector Regression
+svr_model <- train(
+  formula_obj,
+  data = train_data,
+  method = "svmRadial",
+  trControl = train_control,
+  tuneLength = 5
+)
+
+# 7. K-Nearest Neighbors
+knn_model <- train(
+  formula_obj,
+  data = train_data,
+  method = "knn",
+  trControl = train_control,
+  tuneGrid = expand.grid(k = 1:20)
+)
+
+# Store models in a list
+models <- list(
+  LinearRegression = lm_model,
+  LASSO = lasso_model,
+  Ridge = ridge_model,
+  ElasticNet = elastic_net_model,
+  GradientBoosting = gbm_model,
+  SupportVectorRegression = svr_model,
+  KNN = knn_model
+)
+```
+
+```{r}
+# Make predictions with each model
+predictions <- list()
+for (model_name in names(models)) {
+  # Handle different prediction methods for different model types
+  if (model_name %in% c("LASSO", "Ridge", "ElasticNet")) {
+    # Models trained on matrix format
+    predictions[[model_name]] <- predict(models[[model_name]], newdata = x_test)
+  } else {
+    # Models trained on formula
+    predictions[[model_name]] <- predict(models[[model_name]], newdata = test_data)
+  }
+}
+
+# Calculate RMSE for each model
+calculate_rmse <- function(pred, actual) {
+  sqrt(mean((pred - actual)^2))
+}
+
+model_rmse <- sapply(predictions, calculate_rmse, actual = y_test)
+print(model_rmse)
+
+# Find the best model (lowest RMSE)
+best_model_name <- names(which.min(model_rmse))
+best_model <- models[[best_model_name]]
+cat("Best model:", best_model_name, "with RMSE:", min(model_rmse), "\n")
+
+# Make predictions with the best model
+if (best_model_name %in% c("LASSO", "Ridge", "ElasticNet")) {
+  test_data$predicted_award_share <- predict(best_model, newdata = x_test)
+} else {
+  test_data$predicted_award_share <- predict(best_model, newdata = test_data)
+}
+
+# For each season, predict the MVP (highest predicted award_share)
+predicted_mvps <- test_data %>%
+  group_by(season) %>%
+  slice_max(order_by = predicted_award_share, n = 1) %>%
+  select(season, player, predicted_award_share, award_share, is_mvp)
+
+# Calculate accuracy
+actual_mvps <- test_data %>%
+  group_by(season) %>%
+  slice_max(order_by = award_share, n = 1) %>%
+  select(season, player, award_share)
+
+comparison <- merge(predicted_mvps, actual_mvps, by = "season", suffixes = c("_predicted", "_actual"))
+correct_predictions <- sum(comparison$player_predicted == comparison$player_actual)
+total_seasons <- nrow(comparison)
+mvp_accuracy <- correct_predictions / total_seasons
+cat("MVP Prediction Accuracy:", mvp_accuracy * 100, "%\n")
+
+# Extract and analyze feature importance for the best model
+if (best_model_name == "LinearRegression") {
+  # For linear regression
+  coefficients <- coef(best_model$finalModel)[-1]  # Remove intercept
+  var_importance <- data.frame(
+    Variable = names(coefficients),
+    Importance = abs(coefficients)
+  )
+  var_importance <- var_importance[order(var_importance$Importance, decreasing = TRUE), ]
+} else if (best_model_name %in% c("LASSO", "Ridge", "ElasticNet")) {
+  # For regularized regression
+  coefficients <- coef(best_model$finalModel, best_model$bestTune$lambda)[, 1][-1]  # Remove intercept
+  var_importance <- data.frame(
+    Variable = names(coefficients),
+    Importance = abs(coefficients)
+  )
+  var_importance <- var_importance[order(var_importance$Importance, decreasing = TRUE), ]
+} else if (best_model_name == "GradientBoosting") {
+  # For GBM
+  var_importance <- summary(best_model$finalModel, plotit = FALSE)
+  var_importance <- var_importance[order(var_importance$rel.inf, decreasing = TRUE), ]
+  names(var_importance)[names(var_importance) == "rel.inf"] <- "Importance"
+} else {
+  # For other models where we may not have direct feature importance
+   var_importance <- correlation_df
+  names(var_importance)[names(var_importance) == "Correlation"] <- "Importance"
+}
+
+print(var_importance)
+```
+
+```{r}
+library(ggplot2)
+library(plotly)
+
+# Compare model performance
+model_performance <- data.frame(
+  Model = names(model_rmse),
+  RMSE = model_rmse
+)
+model_performance <- model_performance[order(model_performance$RMSE), ]
+
+# Model comparison visualization
+p1 <- ggplot(model_performance, aes(x = reorder(Model, -RMSE), y = RMSE)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "Model Performance Comparison", x = "Model", y = "RMSE (lower is better)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplotly(p1)
+
+```
+
+```{r}
+# Feature importance visualization
+p2 <- ggplot(head(var_importance, 10), aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = paste("Feature Importance -", best_model_name), x = "", y = "Importance")
+
+ggplotly(p2)
+```
+
+```{r}
+# Actual vs. Predicted visualization
+results <- data.frame(
+  Player = test_data$player,
+  Season = test_data$season,
+  Actual = test_data$award_share,
+  Predicted = test_data$predicted_award_share
+)
+
+p3 <- ggplot(results, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Actual vs Predicted MVP Award Shares",
+       x = "Actual Award Share",
+       y = "Predicted Award Share")
+
+ggplotly(p3)
+```
+
+```{r}
+# Top 10 predicted MVPs visualization
+top_predictions <- test_data %>%
+  arrange(desc(predicted_award_share)) %>%
+  head(10)
+
+p5 <- ggplot(top_predictions, aes(x = reorder(player, predicted_award_share), y = predicted_award_share)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Top 10 Predicted MVP Candidates", x = "", y = "Predicted Award Share")
+
+ggplotly(p5)
+```
+
+```{r}
+cat("Best model:", best_model_name, "\n")
+cat("Model RMSE:", round(min(model_rmse), 4), "\n")
+cat("MVP Prediction Accuracy:", round(mvp_accuracy * 100, 1), "%", "\n")
+cat("Top 3 most important features:", "\n")
+cat("1.", var_importance$Variable[1], "\n")
+cat("2.", var_importance$Variable[2], "\n")
+cat("3.", var_importance$Variable[3], "\n")
+```
+
+## Conclusion
+
+This analysis demonstrates that our model can predict NBA MVP candidates with reasonable accuracy. The r best_model_name model performed best with an RMSE of 0.492. We were able to correctly identify the MVP winner 50% of test seasons.
+The most important features for predicting MVP status are r var_importance$Variable[1], r var_importance$Variable[2], and r var_importance$Variable[3], indicating that these statistics have the strongest influence on MVP voting patterns.
+
+## Next Steps
+
+1 Collect more recent data to validate the model on the latest seasons
+2 Explore additional features such as media attention metrics
+3 Develop an ensemble approach combining multiple top-performing models
+4 Create an interactive prediction tool for upcoming seasons
